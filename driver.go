@@ -1,25 +1,27 @@
 package main
 
 import (
-	"fmt"
-	"net/http"
-	"io/ioutil"
-	"time"
 	"bytes"
+	"fmt"
+	"io/ioutil"
+	"net/http"
+	"net/url"
+	"os"
 	"strings"
-	
-	"github.com/go-ini/ini"
-	"github.com/ChrisTrenkamp/goxpath/goxpath"
-	"github.com/ChrisTrenkamp/goxpath/tree/xmltree"
+	"time"
 
+	"github.com/ChrisTrenkamp/goxpath"
+	"github.com/ChrisTrenkamp/goxpath/tree"
+	"github.com/ChrisTrenkamp/goxpath/tree/xmltree"
 	. "github.com/ahmetalpbalkan/go-linq"
+	"github.com/go-ini/ini"
 )
 
 type ZoneRecord struct {
 	Host string
 	Type string
 	Data string
-	TTL string
+	TTL  string
 }
 
 type Credentials struct {
@@ -46,7 +48,13 @@ func getCurrentExternalIP() string {
 
 func getZonesFromLiveDns(username string, password string, zone string) string {
 
-	res, err := http.Get(fmt.Sprintf("https://domains.livedns.co.il/API/DomainsAPI.asmx/GetZoneRecords?UserName=%s&Password=%s&DomainName=%s", username, password, zone))
+	u, _ := url.Parse("https://domains.livedns.co.il/API/DomainsAPI.asmx/GetZoneRecords")
+	q := u.Query()
+	q.Set("Username", username)
+	q.Set("Password", password)
+	q.Set("DomainName", zone)
+	u.RawQuery = q.Encode()
+	res, err := http.Get(u.String())
 
 	if err != nil {
 		return ""
@@ -62,29 +70,34 @@ func getZonesFromLiveDns(username string, password string, zone string) string {
 	return string(contents)
 }
 
-func getZones() []ZoneRecord {
+func getZones(cred *Credentials) []ZoneRecord {
 
-	xml := getZonesFromLiveDns("", "", "")
+	xml := getZonesFromLiveDns(cred.Username, cred.Password, "krapivin.co.il")
+	fmt.Printf(xml)
 	xp := goxpath.MustParse(`//LiveDnsResult/ZoneRecord`)
-	t := xmltree.MustParseXML(bytes.NewBufferString(xml))
-	zones := xmltree.Exec(xp, t, nil)
+	t, _ := xmltree.ParseXML(bytes.NewBufferString(xml))
+	zones, _ := xp.ExecNode(t)
 
-	zonesArray := make([]ZoneRecord,0)
+	zonesArray := make([]ZoneRecord, 0)
 	for _, zone := range zones {
+		host, _ := goxpath.MustParse(`/Host`).Exec(zone)
+		recType, _ := goxpath.MustParse(`/Type`).Exec(zone)
+		data, _ := goxpath.MustParse(`/Data`).Exec(zone)
+		ttl, _ := goxpath.MustParse(`/TTL`).Exec(zone)
+
 		zonesArray = append(zonesArray, ZoneRecord{
-			Host:xmltree.Exec(goxpath.MustParse(`/Host`), zone, nil)[0].String(),
-			Type:xmltree.Exec(goxpath.MustParse(`/Type`), zone, nil)[0].String(),
-			Data:xmltree.Exec(goxpath.MustParse(`/Data`), zone, nil)[0].String(),
-			TTL:xmltree.Exec(goxpath.MustParse(`/TTL`), zone, nil)[0].String(),
+			Host: host.(tree.Elem).ResValue(),
+			Type: recType.(tree.Elem).ResValue(),
+			Data: data.(tree.Elem).ResValue(),
+			TTL:  ttl.(tree.Elem).ResValue(),
 		})
 	}
-	getARecords := func (in T) (bool, error) {
-		return strings.Compare(in.(ZoneRecord).Type, "Host (A)") == 0, nil
-	}
 
-	res, _ := From(zonesArray).Where(getARecords).Results()
+	res := From(zonesArray).Where(func(z interface{}) bool {
+		return strings.Compare(z.(ZoneRecord).Type, "Host (A)") == 0
+	}).Results()
 
-	result := make([]ZoneRecord,len(res))
+	result := make([]ZoneRecord, len(res))
 	for i := range res {
 		result[i] = res[i].(ZoneRecord)
 	}
@@ -95,8 +108,8 @@ func updateZone(zone *ZoneRecord, newIP string) bool {
 	return false
 }
 
-func updateLiveDnsIP(credentials Credentials, ip string) bool{
-	zones := getZones()
+func updateLiveDnsIP(credentials Credentials, ip string) bool {
+	zones := getZones(&credentials)
 	for _, zone := range zones {
 		suc := updateZone(&zone, ip)
 		if suc {
@@ -110,9 +123,19 @@ func updateLiveDnsIP(credentials Credentials, ip string) bool{
 	return true
 }
 
-func main()
-{
+func main() {
+	cred := new(Credentials)
+
 	cfg, err := ini.Load("settings.ini")
+	if err != nil {
+		fmt.Printf("An error occured while loading settings.ini. loading credentials from env. var.")
+		cred.Password = os.Getenv("live_pass")
+		cred.Username = os.Getenv("live_user")
+	}
+
+	credSection, _ := cfg.GetSection("credentials") // return error too
+	cred.Username = credSection.Key("username").String()
+	cred.Password = credSection.Key("password").String()
 
 	ticker := time.NewTicker(time.Second)
 
@@ -124,7 +147,7 @@ func main()
 			fmt.Printf("%s > Differents IPs, \n\tCur.: %s, \n\tPrev.: %s\n", t.UTC().Format(time.RFC3339), curIp, ip)
 			fmt.Printf("%s > Updaing LiveDNS via DomainAPI...\n", time.Now().UTC().Format(time.RFC3339))
 
-			success := updateLiveDnsIP(curIp)
+			success := updateLiveDnsIP(*cred, curIp)
 			if success {
 				ip = curIp
 				fmt.Printf("%s > Done.\n", time.Now().UTC().Format(time.RFC3339))
